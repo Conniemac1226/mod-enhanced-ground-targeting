@@ -50,53 +50,137 @@ struct AOEPosition
     AOEPosition(float _x, float _y, float _z, uint32 _count) : x(_x), y(_y), z(_z), targetCount(_count), isValid(true) {}
 };
 
-// AzerothCore-style position validation (based on SpellEffects.cpp research)
+// Enhanced position validation with fallback system
 bool ValidateAndAdjustPosition(Player* player, float& x, float& y, float& z, SpellInfo const* spellInfo)
 {
     if (!player || !spellInfo)
         return false;
+        
+    Map* map = player->GetMap();
+    if (!map)
+        return false;
     
-    float originalX = x, originalY = y, originalZ = z;
+    // Get spell range for validation
     float maxRange = spellInfo->GetMaxRange(false);
+    float minRange = spellInfo->GetMinRange(false);
     
-    // Phase 1: AzerothCore 6-yard Z-difference rule (SpellEffects.cpp:2502-2503)
-    if (std::fabs(player->GetPositionZ() - z) > 6.0f)
+    // Phase 1: Try original position with terrain validation
+    float originalX = x, originalY = y, originalZ = z;
+    
+    // Get proper ground height using AzerothCore API
+    float groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z, true, 50.0f);
+    if (groundZ > INVALID_HEIGHT)
     {
-        z = player->GetPositionZ(); // Adjust Z like AzerothCore does
+        z = groundZ;
+        
+        // Validate line of sight from player to position
+        bool hasLoS = map->isInLineOfSight(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() + 2.0f,
+                                          x, y, z + 2.0f, player->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2);
+        
+        // Check range constraints
+        float distanceToPlayer = player->GetExactDist2d(x, y);
+        bool rangeValid = (maxRange <= 0 || distanceToPlayer <= maxRange) && 
+                         (minRange <= 0 || distanceToPlayer >= minRange);
+        
+        if (hasLoS && rangeValid)
+        {
+            return true; // Original position is valid
+        }
     }
     
-    // Update ground position using AzerothCore method
+    // Phase 2: Try adjusting Z coordinate only
+    x = originalX;
+    y = originalY;
     player->UpdateAllowedPositionZ(x, y, z);
     
-    // Check basic range constraint
-    float distanceToPlayer = player->GetExactDist2d(x, y);
-    if (maxRange > 0 && distanceToPlayer <= maxRange)
+    groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z, true, 50.0f);
+    if (groundZ > INVALID_HEIGHT)
     {
-        return true; // Position valid - AzerothCore style (no LoS check)
+        z = groundZ;
+        
+        bool hasLoS = map->isInLineOfSight(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() + 2.0f,
+                                          x, y, z + 2.0f, player->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2);
+        
+        float distanceToPlayer = player->GetExactDist2d(x, y);
+        bool rangeValid = (maxRange <= 0 || distanceToPlayer <= maxRange) && 
+                         (minRange <= 0 || distanceToPlayer >= minRange);
+        
+        if (hasLoS && rangeValid)
+        {
+            return true; // Z-adjusted position is valid
+        }
     }
     
-    // Phase 2: Use AzerothCore's GetRandomPoint method (SpellEffects.cpp:2467, 6049)
-    float searchRadius = maxRange > 0 ? std::min(8.0f, maxRange * 0.3f) : 8.0f;
-    Position originalPos(originalX, originalY, originalZ);
-    Position randomPos = player->GetRandomPoint(originalPos, searchRadius);
+    // Phase 3: Search for nearby valid positions using GetRandomPoint pattern
+    float searchDistance = std::min(5.0f, maxRange > 0 ? maxRange * 0.2f : 5.0f);
     
-    // AzerothCore automatically handles ground height in GetRandomPoint
-    x = randomPos.GetPositionX();
-    y = randomPos.GetPositionY(); 
-    z = randomPos.GetPositionZ();
-    
-    // Check range constraint for random position
-    distanceToPlayer = player->GetExactDist2d(x, y);
-    if (maxRange <= 0 || distanceToPlayer <= maxRange)
+    for (int attempts = 0; attempts < 8; attempts++)
     {
-        return true; // Random position valid
+        // Create search positions around the original point
+        float angle = (2.0f * M_PI * attempts) / 8.0f; // 8 directions around circle
+        float searchX = originalX + searchDistance * std::cos(angle);
+        float searchY = originalY + searchDistance * std::sin(angle);
+        float searchZ = originalZ;
+        
+        // Normalize coordinates using AzerothCore method
+        Acore::NormalizeMapCoord(searchX);
+        Acore::NormalizeMapCoord(searchY);
+        
+        // Get ground height
+        groundZ = map->GetHeight(player->GetPhaseMask(), searchX, searchY, searchZ, true, 50.0f);
+        if (groundZ <= INVALID_HEIGHT)
+            continue;
+            
+        searchZ = groundZ;
+        
+        // Validate line of sight
+        bool hasLoS = map->isInLineOfSight(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ() + 2.0f,
+                                          searchX, searchY, searchZ + 2.0f, player->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::M2);
+        
+        if (!hasLoS)
+            continue;
+        
+        // Check range constraints
+        float distanceToPlayer = player->GetExactDist2d(searchX, searchY);
+        bool rangeValid = (maxRange <= 0 || distanceToPlayer <= maxRange) && 
+                         (minRange <= 0 || distanceToPlayer >= minRange);
+        
+        if (rangeValid)
+        {
+            x = searchX;
+            y = searchY;
+            z = searchZ;
+            return true; // Found valid nearby position
+        }
     }
     
-    // Phase 3: Last resort - player position (always succeeds)
+    // Phase 4: Fallback to player position (within range limits)
+    if (maxRange > 0 && maxRange > 8.0f)
+    {
+        // Position spell at max safe range in direction of original target
+        float angle = player->GetAngle(originalX, originalY);
+        float safeRange = maxRange * 0.8f; // Use 80% of max range for safety
+        
+        x = player->GetPositionX() + safeRange * std::cos(angle);
+        y = player->GetPositionY() + safeRange * std::sin(angle);
+        z = player->GetPositionZ();
+        
+        Acore::NormalizeMapCoord(x);
+        Acore::NormalizeMapCoord(y);
+        
+        groundZ = map->GetHeight(player->GetPhaseMask(), x, y, z, true, 50.0f);
+        if (groundZ > INVALID_HEIGHT)
+        {
+            z = groundZ;
+            return true; // Fallback position valid
+        }
+    }
+    
+    // Phase 5: Last resort - use player's current position
     x = player->GetPositionX();
     y = player->GetPositionY();
     z = player->GetPositionZ();
-    return true;
+    return true; // Always succeed with player position
 }
 
 // Find maximum density cluster of enemies (based on playerbot algorithm)
