@@ -265,14 +265,7 @@ public:
             if (!spell)
                 return;
                 
-            // ALWAYS override the destination, regardless of cursor position
-            // This bypasses the cursor validation that causes error sounds
             
-            // Debug message for testing
-            if (player->GetSession()->GetSecurity() >= SEC_PLAYER)
-            {
-                ChatHandler(player->GetSession()).PSendSysMessage("Enhanced Ground Targeting: Processing spell %s", GetSpellInfo()->SpellName[0]);
-            }
                 
             // Get spell info for AOE radius calculation
             SpellInfo const* spellInfo = GetSpellInfo();
@@ -322,7 +315,6 @@ public:
             }
             
             float targetX, targetY, targetZ;
-            uint32 hitCount = 0;
             bool useOptimalPosition = false;
             
             // Check if smart positioning is enabled
@@ -340,7 +332,6 @@ public:
                     targetX = optimalPos.x;
                     targetY = optimalPos.y;
                     targetZ = optimalPos.z;
-                    hitCount = optimalPos.targetCount;
                     useOptimalPosition = true;
                 }
                 else
@@ -352,82 +343,51 @@ public:
                         targetX = target->GetPositionX();
                         targetY = target->GetPositionY();
                         targetZ = target->GetPositionZ();
-                        hitCount = 1;
                         
-                        // Validate and adjust target position
                         ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
                     }
                     else
                     {
-                        // No target and no optimal position, use player position as fallback
                         targetX = player->GetPositionX();
                         targetY = player->GetPositionY();
                         targetZ = player->GetPositionZ();
-                        hitCount = 0;
                         
-                        // Validate and adjust fallback position
                         ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
                     }
                 }
             }
             else
             {
-                // Smart positioning disabled, use simple target positioning
                 Unit* target = player->GetSelectedUnit();
                 if (target)
                 {
                     targetX = target->GetPositionX();
                     targetY = target->GetPositionY();
                     targetZ = target->GetPositionZ();
-                    hitCount = 1;
                     
-                    // Validate and adjust target position
                     ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
                 }
                 else
                 {
-                    // No target available, use player position as fallback
                     targetX = player->GetPositionX();
                     targetY = player->GetPositionY();
                     targetZ = player->GetPositionZ();
-                    hitCount = 0;
                     
-                    // Validate and adjust fallback position
                     ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
                 }
             }
-            
-            // Final validation has already been done by ValidateAndAdjustPosition above
-            // No need for additional validation since the new system is comprehensive
-            
-            // Set spell destination - this overrides any cursor position
+            // Set spell destination
             spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
             
-            // Force the TARGET_FLAG_DEST_LOCATION flag to be set
             uint32 targetFlags = spell->m_targets.GetTargetMask();
             targetFlags |= TARGET_FLAG_DEST_LOCATION;
-            // Clear other target flags that might interfere
             targetFlags &= ~TARGET_FLAG_UNIT;
             targetFlags &= ~TARGET_FLAG_GAMEOBJECT;
             spell->m_targets.SetTargetMask(targetFlags);
             
-            // Clear unit target to prevent confusion
             spell->m_targets.SetUnitTarget(nullptr);
-            
-            // Set source to player position for range calculation
             spell->m_targets.SetSrc(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ());
             
-            // Debug message for GMs
-            if (player->GetSession()->GetSecurity() >= SEC_GAMEMASTER)
-            {
-                const char* positionType = useOptimalPosition ? "OPTIMAL CLUSTER (combat targets)" : "target";
-                ChatHandler(player->GetSession()).PSendSysMessage(
-                    "Enhanced Ground Targeting: %s placed at %s position (%.2f, %.2f, %.2f) - %u targets", 
-                    spellInfo->SpellName[0],
-                    positionType,
-                    targetX, targetY, targetZ,
-                    hitCount);
-            }
         }
 
         void Register() override
@@ -476,7 +436,6 @@ public:
             }
             else
             {
-                // Use player position as fallback
                 targetX = player->GetPositionX();
                 targetY = player->GetPositionY();
                 targetZ = player->GetPositionZ();
@@ -613,29 +572,16 @@ public:
                 targetX = optimalPos.x;
                 targetY = optimalPos.y;
                 targetZ = optimalPos.z;
-                
-                if (player->GetSession()->GetSecurity() >= SEC_PLAYER)
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage("Smart positioning: Found optimal cluster with %u combat targets", optimalPos.targetCount);
-                }
             }
         }
         
-        // Use enhanced validation system for better position validation
         ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spell->GetSpellInfo());
         
-        // Force the destination regardless of what the client sent
         spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
         spell->m_targets.SetTargetMask(TARGET_FLAG_DEST_LOCATION);
-        spell->m_targets.SetUnitTarget(nullptr); // Clear any unit target
+        spell->m_targets.SetUnitTarget(nullptr);
         
-        if (player->GetSession()->GetSecurity() >= SEC_PLAYER)
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage("Enhanced Ground Targeting: Forced destination for %s at (%.1f, %.1f, %.1f)", 
-                spell->GetSpellInfo()->SpellName[0], targetX, targetY, targetZ);
-        }
-        
-        return true; // Always allow preparation
+        return true;
     }
 
     void OnSpellCheckCast(Spell* spell, bool /*strict*/, SpellCastResult& res) override
@@ -707,61 +653,31 @@ public:
             }
             else
             {
-                // Use player position as fallback
                 targetX = player->GetPositionX();
                 targetY = player->GetPositionY();
                 targetZ = player->GetPositionZ();
             }
             
-            // Use enhanced validation system instead of basic validation
             SpellInfo const* spellInfo = spell->GetSpellInfo();
             ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
             
-            // Set destination to prevent cursor validation errors
             spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
             spell->m_targets.SetTargetMask(spell->m_targets.GetTargetMask() | TARGET_FLAG_DEST_LOCATION);
             
-            if (player->GetSession()->GetSecurity() >= SEC_PLAYER)
+            // Handle specific error types
+            if (originalError == SPELL_FAILED_ONLY_OUTDOORS)
             {
-                const char* errorName = "unknown";
-                switch(originalError)
-                {
-                    case SPELL_FAILED_BAD_TARGETS: errorName = "BAD_TARGETS"; break;
-                    case SPELL_FAILED_NO_VALID_TARGETS: errorName = "NO_VALID_TARGETS"; break;
-                    case SPELL_FAILED_REQUIRES_AREA: errorName = "REQUIRES_AREA"; break;
-                    case SPELL_FAILED_BAD_IMPLICIT_TARGETS: errorName = "BAD_IMPLICIT_TARGETS"; break;
-                    case SPELL_FAILED_ONLY_OUTDOORS: errorName = "ONLY_OUTDOORS"; break;
-                    case SPELL_FAILED_LINE_OF_SIGHT: errorName = "LINE_OF_SIGHT"; break;
-                    case SPELL_FAILED_OUT_OF_RANGE: errorName = "OUT_OF_RANGE"; break;
-                    case SPELL_FAILED_TOO_CLOSE: errorName = "TOO_CLOSE"; break;
-                }
-                ChatHandler(player->GetSession()).PSendSysMessage("Enhanced Ground Targeting: Fixed %s error for %s at (%.1f, %.1f, %.1f)", 
-                    errorName, spell->GetSpellInfo()->SpellName[0], targetX, targetY, targetZ);
+                targetX = player->GetPositionX() + 5.0f;
+                targetY = player->GetPositionY() + 5.0f;
+                targetZ = player->GetPositionZ();
+                player->UpdateAllowedPositionZ(targetX, targetY, targetZ);
+                spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
             }
             
-            // For certain errors, we need to be more aggressive
-            if (originalError == SPELL_FAILED_ONLY_OUTDOORS || originalError == SPELL_FAILED_REQUIRES_AREA)
-            {
-                // These are fundamental spell restrictions that we can't easily override
-                // Let's try forcing a different approach
-                
-                // Try to use player's current position for outdoor spells
-                if (originalError == SPELL_FAILED_ONLY_OUTDOORS)
-                {
-                    targetX = player->GetPositionX() + 5.0f;
-                    targetY = player->GetPositionY() + 5.0f;
-                    targetZ = player->GetPositionZ();
-                    player->UpdateAllowedPositionZ(targetX, targetY, targetZ);
-                    spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-                }
-            }
-            
-            // Override the result to allow casting
             res = SPELL_CAST_OK;
         }
         else if (!(spell->m_targets.GetTargetMask() & TARGET_FLAG_DEST_LOCATION))
         {
-            // No destination set at all, force one
             Unit* target = player->GetSelectedUnit();
             float targetX, targetY, targetZ;
             
@@ -773,23 +689,16 @@ public:
             }
             else
             {
-                // Use player position as fallback
                 targetX = player->GetPositionX();
                 targetY = player->GetPositionY();
                 targetZ = player->GetPositionZ();
             }
             
-            // Use enhanced validation system for better position validation
             ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spell->GetSpellInfo());
             
-            // Set destination
             spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
             spell->m_targets.SetTargetMask(spell->m_targets.GetTargetMask() | TARGET_FLAG_DEST_LOCATION);
             
-            if (player->GetSession()->GetSecurity() >= SEC_PLAYER)
-            {
-                ChatHandler(player->GetSession()).PSendSysMessage("Enhanced Ground Targeting: Added missing destination for %s", spell->GetSpellInfo()->SpellName[0]);
-            }
         }
     }
 };
@@ -805,22 +714,10 @@ public:
         if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
             return;
 
-        // All classes can benefit from enhanced ground targeting
-        bool smartEnabled = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.SmartPositioning", true);
-        if (smartEnabled)
-        {
-            ChatHandler(player->GetSession()).SendSysMessage("This server has enhanced ground-targeted spells with SMART positioning! The system calculates optimal AOE placement for combat targets only (no unwanted pulls). Use .toggle to enable/disable it.");
-        }
-        else
-        {
-            ChatHandler(player->GetSession()).SendSysMessage("This server has enhanced ground-targeted spells with auto-targeting! Use .toggle to enable/disable it.");
-        }
     }
     
     void OnPlayerSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
     {
-        // This hook is too late - spell has already been validated
-        // We'll keep it as a safety net but the real work is done earlier
     }
 };
 
@@ -943,15 +840,6 @@ public:
                 targetX = optimalPos.x;
                 targetY = optimalPos.y;
                 targetZ = optimalPos.z;
-                handler->PSendSysMessage("Using optimal position for %u combat targets", optimalPos.targetCount);
-            }
-            else if (optimalPos.targetCount == 1)
-            {
-                handler->PSendSysMessage("Only %u combat target found, using target position", optimalPos.targetCount);
-            }
-            else
-            {
-                handler->PSendSysMessage("No combat targets found, using fallback position");
             }
         }
         
@@ -966,15 +854,7 @@ public:
         // Restore original state
         SetPlayerToggleState(player->GetGUID().GetCounter(), wasEnabled);
         
-        if (result == SPELL_CAST_OK)
-        {
-            handler->PSendSysMessage("Successfully cast %s at position (%.2f, %.2f, %.2f)", 
-                spellInfo->SpellName[0], targetX, targetY, targetZ);
-        }
-        else
-        {
-            handler->PSendSysMessage("Failed to cast %s - result: %u", spellInfo->SpellName[0], result);
-        }
+        handler->PSendSysMessage("Test cast result: %s", result == SPELL_CAST_OK ? "SUCCESS" : "FAILED");
         
         return true;
     }
