@@ -92,11 +92,8 @@ bool ValidateAndAdjustPosition(Player* player, float& x, float& y, float& z, Spe
         return true; // Random position valid
     }
     
-    // Phase 3: Last resort - player position (always succeeds)
-    x = player->GetPositionX();
-    y = player->GetPositionY();
-    z = player->GetPositionZ();
-    return true;
+    // Phase 3: No valid position found - let spell fail naturally
+    return false;
 }
 
 // Find maximum density cluster of enemies (based on playerbot algorithm)
