@@ -106,7 +106,7 @@ std::vector<Unit*> FindMaxDensity(Player* player, float aoeRadius = 8.0f)
     std::list<Unit*> targets;
     Acore::AnyUnfriendlyUnitInObjectRangeCheck u_check(player, player, 35.0f);
     Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(player, targets, u_check);
-    Cell::VisitAllObjects(player, searcher, 35.0f);
+    Cell::VisitObjects(player, searcher, 35.0f);
     
     // Convert to vector and filter for combat-relevant targets only
     for (Unit* unit : targets)
