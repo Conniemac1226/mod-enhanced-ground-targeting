@@ -1,10 +1,6 @@
 -- Clean up any existing entries
-DELETE FROM spell_script_names WHERE ScriptName = 'spell_enhanced_ground_targeting';
-
--- Add entries for spells that require manual ground targeting
-
--- WARLOCK SPELLS
-INSERT INTO spell_script_names (spell_id, ScriptName) VALUES 
+DELETE FROM `spell_script_names` WHERE `ScriptName` = 'spell_enhanced_ground_targeting';
+INSERT INTO `spell_script_names` (`spell_id`, `ScriptName`) VALUES
 (5740, 'spell_enhanced_ground_targeting'),   -- Rain of Fire Rank 1
 (6219, 'spell_enhanced_ground_targeting'),   -- Rain of Fire Rank 2
 (11677, 'spell_enhanced_ground_targeting'),  -- Rain of Fire Rank 3
@@ -63,6 +59,11 @@ INSERT INTO spell_script_names (spell_id, ScriptName) VALUES
 (27022, 'spell_enhanced_ground_targeting'),   -- Volley Rank 4
 (58431, 'spell_enhanced_ground_targeting'),   -- Volley Rank 5
 (58432, 'spell_enhanced_ground_targeting'),   -- Volley Rank 6
+(900000, 'spell_enhanced_ground_targeting'),  -- Launch Freezing Trap
+(900001, 'spell_enhanced_ground_targeting'),  -- Launch Frost Trap
+(900002, 'spell_enhanced_ground_targeting'),  -- Launch Immolation Trap
+(900003, 'spell_enhanced_ground_targeting'),  -- Launch Explosive Trap
+(900004, 'spell_enhanced_ground_targeting'),  -- Launch Snake Trap
 
 -- DEATH KNIGHT SPELLS
 (43265, 'spell_enhanced_ground_targeting'),   -- Death and Decay Rank 1

@@ -4,6 +4,7 @@
 #include "Chat.h"
 #include "Spell.h"
 #include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "SpellScript.h"
 #include "ObjectMgr.h"
 #include "GridNotifiers.h"
@@ -496,7 +497,6 @@ private:
     uint32 minEnemiesForSmart;
 };
 
-// All Spell Script for early interception
 class EnhancedGroundTargeting_AllSpellScript : public AllSpellScript
 {
 public:
@@ -504,29 +504,30 @@ public:
 
     bool CanPrepare(Spell* spell, SpellCastTargets const* targets, AuraEffect const* /*triggeredByAura*/) override
     {
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
-            return true;
-            
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true))
-            return true;
-
         Unit* caster = spell->GetCaster();
         if (!caster || !caster->ToPlayer())
             return true;
 
         Player* player = caster->ToPlayer();
+        uint32 spellId = spell->GetSpellInfo()->Id;
+
+        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
+            return true;
+
+        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true))
+            return true;
         
         // Check if player has toggled off the feature
         if (!GetPlayerToggleState(player->GetGUID().GetCounter()))
             return true;
             
         // Check if this is one of our registered spells
-        uint32 spellId = spell->GetSpellInfo()->Id;
         bool isRegisteredSpell = false;
         
         // Check against registered spell IDs
         std::vector<uint32> registeredSpells = {
             1510, 14294, 14295, 27022, 58431, 58432, // Volley
+            900000, 900001, 900002, 900003, 900004, // Trap Launcher
             10, 6141, 8427, 10185, 10186, 10187, 27085, 42939, 42940, // Blizzard
             5740, 6219, 11677, 11678, 27212, 47819, 47820, // Rain of Fire
             43265, 49936, 49937, 49938, // Death and Decay
@@ -610,6 +611,8 @@ public:
         std::vector<uint32> registeredSpells = {
             // Volley
             1510, 14294, 14295, 27022, 58431, 58432,
+            // Trap Launcher
+            900000, 900001, 900002, 900003, 900004,
             // Blizzard
             10, 6141, 8427, 10185, 10186, 10187, 27085, 42939, 42940,
             // Rain of Fire

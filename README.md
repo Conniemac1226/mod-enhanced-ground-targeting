@@ -75,8 +75,8 @@ GMs receive detailed debug information:
 
 1. Copy the module to your `modules/` directory
 2. Configure your desired settings in `EnhancedGroundTargeting.conf`
-3. Apply the SQL file to register spells: `sql/world/enhanced_ground_targeting.sql`
-4. Build and restart your server
+3. Restart the worldserver so the module SQL under `data/sql/world/updates/` is auto-applied
+4. Build and restart your server if you changed C++ sources or configuration
 
 ## Benefits
 
