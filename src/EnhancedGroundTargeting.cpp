@@ -1,743 +1,533 @@
-#include "ScriptMgr.h"
-#include "Player.h"
-#include "Config.h"
+#include "CellImpl.h"
+#include "CharacterDatabase.h"
 #include "Chat.h"
-#include "Spell.h"
-#include "SpellInfo.h"
-#include "SpellMgr.h"
-#include "SpellScript.h"
-#include "ObjectMgr.h"
+#include "Config.h"
+#include "DataMap.h"
+#include "DatabaseEnv.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
-#include "CellImpl.h"
-#include "Unit.h"
-#include "GameObject.h"
-#include "World.h"
+#include "Group.h"
+#include "ObjectAccessor.h"
 #include "Pet.h"
-#include <unordered_map>
-#include <mutex>
+#include "Player.h"
+#include "PlayerSettings.h"
+#include "ScriptMgr.h"
+#include "Spell.h"
+#include "SpellInfo.h"
+#include "WorldSession.h"
+
 #include <algorithm>
-#include <vector>
-#include <map>
-#include <list>
+#include <array>
+#include <atomic>
+#include <cctype>
 #include <cmath>
+#include <limits>
+#include <list>
+#include <string>
+#include <utility>
+#include <vector>
 
-// Player-specific toggle storage
-static std::unordered_map<uint64, bool> playerToggleState;
-static std::mutex toggleMutex;
-
-// Helper functions for player toggle state
-bool GetPlayerToggleState(uint64 playerGuid)
+namespace
 {
-    std::lock_guard<std::mutex> lock(toggleMutex);
-    auto it = playerToggleState.find(playerGuid);
-    return it != playerToggleState.end() ? it->second : false; // Default to disabled
-}
+constexpr char SETTING_SOURCE[] = "mod_enhanced_ground_targeting";
+constexpr uint32 SETTING_ENABLED = 0;
+constexpr float DEFAULT_AOE_RADIUS = 8.0f;
+constexpr float MAX_VERTICAL_SEPARATION = 6.0f;
+constexpr float POSITION_EPSILON = 0.01f;
 
-void SetPlayerToggleState(uint64 playerGuid, bool enabled)
+struct ModuleSettings
 {
-    std::lock_guard<std::mutex> lock(toggleMutex);
-    playerToggleState[playerGuid] = enabled;
-}
-
-// Structure to hold AOE position data
-struct AOEPosition
-{
-    float x, y, z;
-    uint32 targetCount;
-    bool isValid;
-    
-    AOEPosition() : x(0.0f), y(0.0f), z(0.0f), targetCount(0), isValid(false) {}
-    AOEPosition(float _x, float _y, float _z, uint32 _count) : x(_x), y(_y), z(_z), targetCount(_count), isValid(true) {}
+    bool Enabled = true;
+    bool AutoTarget = true;
+    bool CombatOnly = true;
+    bool SmartPositioning = true;
+    uint32 MinEnemiesForSmart = 2;
 };
 
-// AzerothCore-style position validation (based on SpellEffects.cpp research)
-bool ValidateAndAdjustPosition(Player* player, float& x, float& y, float& z, SpellInfo const* spellInfo)
+struct ToggleState : public DataMap::Base
 {
-    if (!player || !spellInfo)
-        return false;
-    
-    float originalX = x, originalY = y, originalZ = z;
-    float maxRange = spellInfo->GetMaxRange(false);
-    
-    // Phase 1: AzerothCore 6-yard Z-difference rule (SpellEffects.cpp:2502-2503)
-    if (std::fabs(player->GetPositionZ() - z) > 6.0f)
+    std::atomic<uint64> LoadId{0};
+    std::atomic<bool> Enabled{false};
+    std::atomic<bool> ChangedAfterLogin{false};
+};
+
+struct PlacementResult
+{
+    Position Destination;
+    uint32 TargetCount = 0;
+    bool IsValid = false;
+};
+
+struct PlacementCoverage
+{
+    uint32 TargetCount = 0;
+    float Clearance = 0.0f;
+};
+
+ModuleSettings moduleSettings;
+std::atomic<uint64> nextLoadId{0};
+
+constexpr std::array<uint32, 48> SUPPORTED_SPELLS = {
+    10, 1122, 1510, 1725, 2120, 2121, 5740, 6141, 6219, 8422, 8423, 8427, 10185, 10186, 10187, 10215,
+    10216, 11677, 11678, 14294, 14295, 16914, 17401, 17402, 27012, 27022, 27085, 27086, 27212, 32375,
+    42925, 42926, 42939, 42940, 43265, 47819, 47820, 48466, 49936, 49937, 49938, 58431, 58432, 900000,
+    900001, 900002, 900003, 900004
+};
+
+bool IsSupportedSpell(uint32 spellId)
+{
+    return std::binary_search(SUPPORTED_SPELLS.begin(), SUPPORTED_SPELLS.end(), spellId);
+}
+
+bool UsesClusterPlacement(uint32 spellId)
+{
+    switch (spellId)
     {
-        z = player->GetPositionZ(); // Adjust Z like AzerothCore does
+        case 1122:   // Summon Infernal
+        case 1725:   // Distract
+        case 32375:  // Mass Dispel
+        case 900000: // Launch Freezing Trap
+        case 900002: // Launch Immolation Trap
+            return false;
+        default:
+            return true;
     }
-    
-    // Update ground position using AzerothCore method
-    player->UpdateAllowedPositionZ(x, y, z);
-    
-    // Check basic range constraint
-    float distanceToPlayer = player->GetExactDist2d(x, y);
-    if (maxRange > 0 && distanceToPlayer <= maxRange)
+}
+
+bool IsEnabledFor(Player const* player)
+{
+    ToggleState const* state = player->CustomData.Get<ToggleState>(SETTING_SOURCE);
+    return state && state->Enabled.load(std::memory_order_relaxed);
+}
+
+void SaveToggleState(Player* player, bool enabled)
+{
+    ToggleState* state = player->CustomData.GetDefault<ToggleState>(SETTING_SOURCE);
+    state->Enabled.store(enabled, std::memory_order_relaxed);
+    state->ChangedAfterLogin.store(true, std::memory_order_relaxed);
+
+    player->UpdatePlayerSetting(SETTING_SOURCE, SETTING_ENABLED, enabled ? 1 : 0);
+
+    PlayerSettingVector settings;
+    settings.emplace_back(enabled ? 1 : 0);
+    CharacterDatabasePreparedStatement* stmt = PlayerSettingsStore::PrepareReplaceStatement(
+        player->GetGUID().GetCounter(), SETTING_SOURCE, settings);
+    CharacterDatabase.Execute(stmt);
+}
+
+void LoadToggleState(ObjectGuid guid, uint64 loadId, PreparedQueryResult result)
+{
+    Player* player = ObjectAccessor::FindConnectedPlayer(guid);
+    ToggleState* state = player ? player->CustomData.Get<ToggleState>(SETTING_SOURCE) : nullptr;
+    if (!state || state->LoadId.load(std::memory_order_relaxed) != loadId ||
+        state->ChangedAfterLogin.load(std::memory_order_relaxed))
+        return;
+
+    bool enabled = false;
+    if (result)
     {
-        return true; // Position valid - AzerothCore style (no LoS check)
+        do
+        {
+            Field* fields = result->Fetch();
+            if (fields[0].Get<std::string>() != SETTING_SOURCE)
+                continue;
+
+            PlayerSettingVector settings = PlayerSettingsStore::ParseSettingsData(fields[1].Get<std::string>());
+            enabled = !settings.empty() && settings[SETTING_ENABLED].IsEnabled();
+            break;
+        } while (result->NextRow());
     }
-    
-    // Phase 2: Use AzerothCore's GetRandomPoint method (SpellEffects.cpp:2467, 6049)
-    float searchRadius = maxRange > 0 ? std::min(8.0f, maxRange * 0.3f) : 8.0f;
-    Position originalPos(originalX, originalY, originalZ);
-    Position randomPos = player->GetRandomPoint(originalPos, searchRadius);
-    
-    // AzerothCore automatically handles ground height in GetRandomPoint
-    x = randomPos.GetPositionX();
-    y = randomPos.GetPositionY(); 
-    z = randomPos.GetPositionZ();
-    
-    // Check range constraint for random position
-    distanceToPlayer = player->GetExactDist2d(x, y);
-    if (maxRange <= 0 || distanceToPlayer <= maxRange)
+
+    state->Enabled.store(enabled, std::memory_order_relaxed);
+}
+
+std::vector<Unit*> CollectProtectedUnits(Player* player)
+{
+    std::vector<Unit*> protectedUnits;
+    protectedUnits.push_back(player);
+    if (Pet* pet = player->GetPet(); pet && pet->IsInMap(player))
+        protectedUnits.push_back(pet);
+
+    Group* group = player->GetGroup();
+    if (!group)
+        return protectedUnits;
+
+    for (GroupReference* reference = group->GetFirstMember(); reference != nullptr; reference = reference->next())
     {
-        return true; // Random position valid
+        Player* member = reference->GetSource();
+        if (!member || member == player || !member->IsInMap(player))
+            continue;
+
+        protectedUnits.push_back(member);
+        if (Pet* pet = member->GetPet(); pet && pet->IsInMap(player))
+            protectedUnits.push_back(pet);
     }
-    
-    // Phase 3: No valid position found - let spell fail naturally
+
+    return protectedUnits;
+}
+
+bool IsCombatRelevant(Player* player, Unit* unit, std::vector<Unit*> const& protectedUnits)
+{
+    if (unit == player->GetSelectedUnit())
+        return true;
+
+    Unit* victim = unit->GetVictim();
+    for (Unit* protectedUnit : protectedUnits)
+        if (victim == protectedUnit || unit->IsInCombatWith(protectedUnit))
+            return true;
+
     return false;
 }
 
-// Find maximum density cluster of enemies (based on playerbot algorithm)
-std::vector<Unit*> FindMaxDensity(Player* player, float aoeRadius = 8.0f)
+float GetAoeRadius(Spell* spell)
 {
-    std::vector<Unit*> allTargets;
-    std::vector<Unit*> bestCluster;
-    
-    // Find all possible targets within reasonable range
-    std::list<Unit*> targets;
-    Acore::AnyUnfriendlyUnitInObjectRangeCheck u_check(player, player, 35.0f);
-    Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(player, targets, u_check);
-    Cell::VisitObjects(player, searcher, 35.0f);
-    
-    // Convert to vector and filter for combat-relevant targets only
-    for (Unit* unit : targets)
+    float radius = 0.0f;
+    SpellInfo const* spellInfo = spell->GetSpellInfo();
+    for (SpellEffectInfo const& effect : spellInfo->Effects)
+    {
+        if (!effect.IsEffect())
+            continue;
+
+        float const effectRadius = effect.CalcRadius(spell->GetCaster(), spell);
+        if (std::isfinite(effectRadius) && effectRadius > radius)
+            radius = effectRadius;
+    }
+
+    return radius > 0.0f ? radius : DEFAULT_AOE_RADIUS;
+}
+
+float GetSpellRange(Spell* spell)
+{
+    SpellInfo const* spellInfo = spell->GetSpellInfo();
+    return spellInfo->GetMaxRange(spellInfo->IsPositive(), spell->GetCaster(), spell);
+}
+
+bool ValidateDestination(Player* player, Spell* spell, Position& destination)
+{
+    float x = destination.GetPositionX();
+    float y = destination.GetPositionY();
+    float z = destination.GetPositionZ();
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+        return false;
+
+    player->UpdateAllowedPositionZ(x, y, z);
+    destination.Relocate(x, y, z, player->GetOrientation());
+    if (!destination.IsPositionValid())
+        return false;
+
+    float const maxRange = GetSpellRange(spell);
+    float const distance = player->GetExactDist(x, y, z);
+    if (maxRange > 0.0f && distance > maxRange + player->GetLeewayBonusRadius())
+        return false;
+
+    float const minRange = spell->GetSpellInfo()->GetMinRange(spell->GetSpellInfo()->IsPositive());
+    if (minRange > 0.0f && distance < minRange)
+        return false;
+
+    SpellInfo const* spellInfo = spell->GetSpellInfo();
+    if (!spellInfo->HasAttribute(SPELL_ATTR2_IGNORE_LINE_OF_SIGHT) &&
+        !spellInfo->HasAttribute(SPELL_ATTR5_ALWAYS_AOE_LINE_OF_SIGHT) &&
+        !player->IsWithinLOS(x, y, z, VMAP::ModelIgnoreFlags::M2))
+        return false;
+
+    return true;
+}
+
+std::vector<Unit*> CollectTargets(Player* player, Spell* spell, float radius)
+{
+    float const maxRange = GetSpellRange(spell);
+    float const scanRange = std::max(radius, maxRange + radius);
+    std::vector<Unit*> const protectedUnits = CollectProtectedUnits(player);
+
+    std::list<Unit*> nearbyUnits;
+    Acore::AnyUnfriendlyUnitInObjectRangeCheck check(player, player, scanRange);
+    Acore::UnitListSearcher<Acore::AnyUnfriendlyUnitInObjectRangeCheck> searcher(player, nearbyUnits, check);
+    Cell::VisitObjects(player, searcher, scanRange);
+
+    std::vector<Unit*> targets;
+    targets.reserve(nearbyUnits.size());
+    for (Unit* unit : nearbyUnits)
     {
         if (!unit || !unit->IsAlive() || unit->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE))
             continue;
-            
-        // Only include targets that are:
-        // 1. Already in combat with the player
-        // 2. The player's current target
-        // 3. Currently attacking the player or player's pet
-        bool isValidTarget = false;
-        
-        // Check if unit is in combat with player
-        if (unit->IsInCombatWith(player))
-        {
-            isValidTarget = true;
-        }
-        // Check if unit is the current target
-        else if (player->GetSelectedUnit() && player->GetSelectedUnit()->GetGUID() == unit->GetGUID())
-        {
-            isValidTarget = true;
-        }
-        // Check if unit is attacking player or player's pet
-        else if (unit->GetVictim() && 
-                (unit->GetVictim()->GetGUID() == player->GetGUID() || 
-                 (player->GetPet() && unit->GetVictim()->GetGUID() == player->GetPet()->GetGUID())))
-        {
-            isValidTarget = true;
-        }
-        
-        if (isValidTarget)
-        {
-            allTargets.push_back(unit);
-        }
-    }
-    
-    if (allTargets.empty())
-        return bestCluster;
-    
-    std::map<Unit*, std::vector<Unit*>> groups;
-    uint32 maxCount = 0;
-    Unit* bestCenter = nullptr;
-    
-    // For each potential target, count how many other targets are within AOE radius
-    for (Unit* unit : allTargets)
-    {
-        for (Unit* other : allTargets)
-        {
-            float distance = unit->GetExactDist2d(other);
-            if (distance <= aoeRadius * 2.0f) // Use 2x radius for better clustering
-            {
-                groups[unit].push_back(other);
-            }
-        }
-        
-        if (groups[unit].size() > maxCount)
-        {
-            maxCount = groups[unit].size();
-            bestCenter = unit;
-        }
-    }
-    
-    if (bestCenter && groups.find(bestCenter) != groups.end())
-    {
-        bestCluster = groups[bestCenter];
-    }
-    
-    return bestCluster;
-}
 
-// Calculate optimal AOE position based on playerbot algorithm with validation
-AOEPosition CalculateOptimalAOEPosition(Player* player, float aoeRadius = 8.0f, SpellInfo const* spellInfo = nullptr)
-{
-    std::vector<Unit*> cluster = FindMaxDensity(player, aoeRadius);
-    
-    if (cluster.empty())
-        return AOEPosition();
-    
-    // Calculate bounding box of the cluster (playerbot method)
-    float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
-    bool firstUnit = true;
-    
-    for (Unit* unit : cluster)
-    {
-        if (!unit)
+        if (moduleSettings.CombatOnly && !IsCombatRelevant(player, unit, protectedUnits))
             continue;
-            
-        float unitX = unit->GetPositionX();
-        float unitY = unit->GetPositionY();
-        
-        if (firstUnit)
-        {
-            x1 = x2 = unitX;
-            y1 = y2 = unitY;
-            firstUnit = false;
-        }
-        else
-        {
-            if (unitX < x1) x1 = unitX;
-            if (unitX > x2) x2 = unitX;
-            if (unitY < y1) y1 = unitY;
-            if (unitY > y2) y2 = unitY;
-        }
+
+        if (!player->IsWithinLOSInMap(unit, VMAP::ModelIgnoreFlags::M2))
+            continue;
+
+        targets.push_back(unit);
     }
-    
-    // Calculate center point of bounding box
-    float centerX = (x1 + x2) / 2.0f;
-    float centerY = (y1 + y2) / 2.0f;
-    float centerZ = player->GetPositionZ();
-    
-    // Use enhanced validation system instead of basic UpdateAllowedPositionZ
-    if (spellInfo && ValidateAndAdjustPosition(player, centerX, centerY, centerZ, spellInfo))
+
+    return targets;
+}
+
+bool CoversTarget(Position const& destination, Unit const* unit, float radius)
+{
+    float const xDifference = destination.GetPositionX() - unit->GetPositionX();
+    float const yDifference = destination.GetPositionY() - unit->GetPositionY();
+    float const zDifference = std::fabs(destination.GetPositionZ() - unit->GetPositionZ());
+    return xDifference * xDifference + yDifference * yDifference <= radius * radius &&
+           zDifference <= MAX_VERTICAL_SEPARATION;
+}
+
+PlacementCoverage EvaluatePlacement(Position const& destination, std::vector<Unit*> const& targets, float radius)
+{
+    PlacementCoverage coverage;
+    float farthestDistanceSquared = 0.0f;
+    for (Unit const* unit : targets)
     {
-        return AOEPosition(centerX, centerY, centerZ, cluster.size());
+        float const xDifference = destination.GetPositionX() - unit->GetPositionX();
+        float const yDifference = destination.GetPositionY() - unit->GetPositionY();
+        float const distanceSquared = xDifference * xDifference + yDifference * yDifference;
+        if (distanceSquared > radius * radius ||
+            std::fabs(destination.GetPositionZ() - unit->GetPositionZ()) > MAX_VERTICAL_SEPARATION)
+            continue;
+
+        ++coverage.TargetCount;
+        farthestDistanceSquared = std::max(farthestDistanceSquared, distanceSquared);
     }
-    else
+
+    coverage.Clearance = radius - std::sqrt(farthestDistanceSquared);
+    return coverage;
+}
+
+void AddCircleIntersectionCandidates(std::vector<Position>& candidates, Unit const* first, Unit const* second,
+                                     float radius)
+{
+    float const xDifference = second->GetPositionX() - first->GetPositionX();
+    float const yDifference = second->GetPositionY() - first->GetPositionY();
+    float const distanceSquared = xDifference * xDifference + yDifference * yDifference;
+    if (distanceSquared <= POSITION_EPSILON || distanceSquared > 4.0f * radius * radius)
+        return;
+
+    float const distance = std::sqrt(distanceSquared);
+    float const midpointX = (first->GetPositionX() + second->GetPositionX()) * 0.5f;
+    float const midpointY = (first->GetPositionY() + second->GetPositionY()) * 0.5f;
+    float const midpointZ = (first->GetPositionZ() + second->GetPositionZ()) * 0.5f;
+    float const offsetLength = std::sqrt(std::max(0.0f, radius * radius - distanceSquared * 0.25f));
+    float const offsetX = -yDifference * offsetLength / distance;
+    float const offsetY = xDifference * offsetLength / distance;
+
+    candidates.emplace_back(midpointX, midpointY, midpointZ);
+    candidates.emplace_back(midpointX + offsetX, midpointY + offsetY, midpointZ);
+    candidates.emplace_back(midpointX - offsetX, midpointY - offsetY, midpointZ);
+}
+
+void AddCoveredCentroidCandidates(std::vector<Position>& candidates, std::vector<Unit*> const& targets, float radius)
+{
+    size_t const initialCandidateCount = targets.size();
+    for (size_t index = 0; index < initialCandidateCount; ++index)
     {
-        // Fallback: use basic method if enhanced validation fails
-        player->UpdateAllowedPositionZ(centerX, centerY, centerZ);
-        return AOEPosition(centerX, centerY, centerZ, cluster.size());
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        uint32 count = 0;
+        for (Unit const* unit : targets)
+        {
+            if (!CoversTarget(candidates[index], unit, radius))
+                continue;
+
+            x += unit->GetPositionX();
+            y += unit->GetPositionY();
+            z += unit->GetPositionZ();
+            ++count;
+        }
+
+        if (count > 1)
+            candidates.emplace_back(x / count, y / count, z / count);
     }
 }
 
-// This is the spell script for auto-targeting ground AoE spells
-class spell_enhanced_ground_targeting : public SpellScriptLoader
+PlacementResult FindOptimalPlacement(Player* player, Spell* spell, std::vector<Unit*> const& targets, float radius)
 {
-public:
-    spell_enhanced_ground_targeting() : SpellScriptLoader("spell_enhanced_ground_targeting") {}
+    PlacementResult best;
+    if (targets.size() < moduleSettings.MinEnemiesForSmart)
+        return best;
 
-    class spell_enhanced_ground_targeting_SpellScript : public SpellScript
+    std::vector<Position> candidates;
+    candidates.reserve(targets.size() * targets.size() * 2);
+    for (Unit const* unit : targets)
+        candidates.emplace_back(unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ());
+
+    AddCoveredCentroidCandidates(candidates, targets, radius);
+
+    for (size_t first = 0; first < targets.size(); ++first)
+        for (size_t second = first + 1; second < targets.size(); ++second)
+            AddCircleIntersectionCandidates(candidates, targets[first], targets[second], radius);
+
+    Unit* selectedTarget = player->GetSelectedUnit();
+    bool bestCoversSelected = false;
+    float bestClearance = -std::numeric_limits<float>::max();
+    float bestSelectedDistance = std::numeric_limits<float>::max();
+    float bestCasterDistance = std::numeric_limits<float>::max();
+
+    for (Position candidate : candidates)
     {
-        PrepareSpellScript(spell_enhanced_ground_targeting_SpellScript);
+        if (!ValidateDestination(player, spell, candidate))
+            continue;
 
-        bool Validate(SpellInfo const* /*spellInfo*/) override
+        PlacementCoverage const coverage = EvaluatePlacement(candidate, targets, radius);
+        uint32 const targetCount = coverage.TargetCount;
+        bool const coversSelected = selectedTarget && CoversTarget(candidate, selectedTarget, radius);
+        float const clearance = coverage.Clearance;
+        float const selectedDistance = selectedTarget ? selectedTarget->GetExactDist2d(
+            candidate.GetPositionX(), candidate.GetPositionY()) : 0.0f;
+        float const casterDistance = player->GetExactDist2d(candidate.GetPositionX(), candidate.GetPositionY());
+
+        bool const isBetter = !best.IsValid || targetCount > best.TargetCount ||
+            (targetCount == best.TargetCount && coversSelected && !bestCoversSelected) ||
+            (targetCount == best.TargetCount && coversSelected == bestCoversSelected &&
+             clearance > bestClearance + POSITION_EPSILON) ||
+            (targetCount == best.TargetCount && coversSelected == bestCoversSelected &&
+             std::fabs(clearance - bestClearance) <= POSITION_EPSILON && selectedDistance < bestSelectedDistance) ||
+            (targetCount == best.TargetCount && coversSelected == bestCoversSelected &&
+             std::fabs(clearance - bestClearance) <= POSITION_EPSILON &&
+             std::fabs(selectedDistance - bestSelectedDistance) <= POSITION_EPSILON &&
+             casterDistance < bestCasterDistance);
+        if (!isBetter)
+            continue;
+
+        best.Destination = candidate;
+        best.TargetCount = targetCount;
+        best.IsValid = true;
+        bestCoversSelected = coversSelected;
+        bestClearance = clearance;
+        bestSelectedDistance = selectedDistance;
+        bestCasterDistance = casterDistance;
+    }
+
+    if (best.TargetCount < moduleSettings.MinEnemiesForSmart)
+        return PlacementResult();
+
+    return best;
+}
+
+bool SelectDestination(Player* player, Spell* spell, Position& destination)
+{
+    uint32 const spellId = spell->GetSpellInfo()->Id;
+    if (moduleSettings.SmartPositioning && UsesClusterPlacement(spellId))
+    {
+        float const radius = GetAoeRadius(spell);
+        std::vector<Unit*> targets = CollectTargets(player, spell, radius);
+        PlacementResult optimal = FindOptimalPlacement(player, spell, targets, radius);
+        if (optimal.IsValid)
         {
+            destination = optimal.Destination;
             return true;
         }
-
-        void HandleBeforeCast()
-        {
-            if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true))
-                return;
-
-            Unit* caster = GetCaster();
-            if (!caster || !caster->ToPlayer())
-                return;
-
-            Player* player = caster->ToPlayer();
-            
-            // Check if player has toggled off the feature
-            if (!GetPlayerToggleState(player->GetGUID().GetCounter()))
-                return;
-                
-            Spell* spell = GetSpell();
-            if (!spell)
-                return;
-                
-            
-                
-            // Get spell info for AOE radius calculation
-            SpellInfo const* spellInfo = GetSpellInfo();
-            if (!spellInfo)
-                return;
-                
-            // Determine AOE radius based on spell (default to 8.0f for most spells)
-            float aoeRadius = 8.0f;
-            uint32 spellId = spellInfo->Id;
-            
-            // Specific radius adjustments for known spells
-            switch (spellId)
-            {
-                case 1510:  // Volley (Rank 1)
-                case 14294: // Volley (Rank 2)
-                case 14295: // Volley (Rank 3)
-                case 27022: // Volley (Rank 4)
-                case 58431: // Volley (Rank 5)
-                case 58432: // Volley (Rank 6)
-                    aoeRadius = 8.0f;
-                    break;
-                case 42208: // Blizzard (all ranks)
-                case 42209:
-                case 42210:
-                case 42211:
-                case 42212:
-                case 42213:
-                case 42214:
-                case 42215:
-                    aoeRadius = 8.0f;
-                    break;
-                case 5740:  // Rain of Fire (all ranks)
-                case 6219:
-                case 11677:
-                case 11678:
-                case 27212:
-                case 47819:
-                case 47820:
-                    aoeRadius = 8.0f;
-                    break;
-                case 43265: // Death and Decay
-                    aoeRadius = 8.0f;
-                    break;
-                default:
-                    aoeRadius = 8.0f; // Default radius for unknown spells
-                    break;
-            }
-            
-            float targetX, targetY, targetZ;
-            bool useOptimalPosition = false;
-            
-            // Check if smart positioning is enabled
-            bool smartEnabled = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.SmartPositioning", true);
-            uint32 minEnemies = sConfigMgr->GetOption<uint32>("EnhancedGroundTargeting.MinEnemiesForSmart", 2);
-            
-            if (smartEnabled)
-            {
-                // Try to calculate optimal AOE position
-                AOEPosition optimalPos = CalculateOptimalAOEPosition(player, aoeRadius, spellInfo);
-                
-                if (optimalPos.isValid && optimalPos.targetCount >= minEnemies)
-                {
-                    // Use optimal position if we found a good cluster
-                    targetX = optimalPos.x;
-                    targetY = optimalPos.y;
-                    targetZ = optimalPos.z;
-                    useOptimalPosition = true;
-                }
-                else
-                {
-                    // Fallback to current target position
-                    Unit* target = player->GetSelectedUnit();
-                    if (target)
-                    {
-                        targetX = target->GetPositionX();
-                        targetY = target->GetPositionY();
-                        targetZ = target->GetPositionZ();
-                        
-                        ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
-                    }
-                    else
-                    {
-                        targetX = player->GetPositionX();
-                        targetY = player->GetPositionY();
-                        targetZ = player->GetPositionZ();
-                        
-                        ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
-                    }
-                }
-            }
-            else
-            {
-                Unit* target = player->GetSelectedUnit();
-                if (target)
-                {
-                    targetX = target->GetPositionX();
-                    targetY = target->GetPositionY();
-                    targetZ = target->GetPositionZ();
-                    
-                    ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
-                }
-                else
-                {
-                    targetX = player->GetPositionX();
-                    targetY = player->GetPositionY();
-                    targetZ = player->GetPositionZ();
-                    
-                    ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
-                }
-            }
-            // Set spell destination
-            spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-            
-            uint32 targetFlags = spell->m_targets.GetTargetMask();
-            targetFlags |= TARGET_FLAG_DEST_LOCATION;
-            targetFlags &= ~TARGET_FLAG_UNIT;
-            targetFlags &= ~TARGET_FLAG_GAMEOBJECT;
-            spell->m_targets.SetTargetMask(targetFlags);
-            
-            spell->m_targets.SetUnitTarget(nullptr);
-            spell->m_targets.SetSrc(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ());
-            
-        }
-
-        void Register() override
-        {
-            OnCheckCast += SpellCheckCastFn(spell_enhanced_ground_targeting_SpellScript::HandleCheckCast);
-            BeforeCast += SpellCastFn(spell_enhanced_ground_targeting_SpellScript::HandleBeforeCast);
-        }
-        
-        SpellCastResult HandleCheckCast()
-        {
-            if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true))
-                return SPELL_CAST_OK;
-
-            Unit* caster = GetCaster();
-            if (!caster || !caster->ToPlayer())
-                return SPELL_CAST_OK;
-
-            Player* player = caster->ToPlayer();
-            
-            // Check if player has toggled off the feature
-            if (!GetPlayerToggleState(player->GetGUID().GetCounter()))
-                return SPELL_CAST_OK;
-                
-            // Force a valid destination early to bypass cursor validation
-            Spell* spell = GetSpell();
-            if (!spell)
-                return SPELL_CAST_OK;
-                
-            // Check if we already have a valid destination
-            if (spell->m_targets.GetTargetMask() & TARGET_FLAG_DEST_LOCATION)
-            {
-                Position const* dest = spell->m_targets.GetDstPos();
-                if (dest && dest->IsPositionValid())
-                    return SPELL_CAST_OK; // Already has valid destination
-            }
-            
-            // No valid destination, create one to prevent cursor errors
-            Unit* target = player->GetSelectedUnit();
-            float targetX, targetY, targetZ;
-            
-            if (target)
-            {
-                targetX = target->GetPositionX();
-                targetY = target->GetPositionY();
-                targetZ = target->GetPositionZ();
-            }
-            else
-            {
-                targetX = player->GetPositionX();
-                targetY = player->GetPositionY();
-                targetZ = player->GetPositionZ();
-            }
-            
-            // Ensure valid ground position
-            player->UpdateAllowedPositionZ(targetX, targetY, targetZ);
-            
-            // Set a temporary destination to prevent cursor validation errors
-            spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-            spell->m_targets.SetTargetMask(spell->m_targets.GetTargetMask() | TARGET_FLAG_DEST_LOCATION);
-            
-            return SPELL_CAST_OK;
-        }
-    };
-
-    SpellScript* GetSpellScript() const override
-    {
-        return new spell_enhanced_ground_targeting_SpellScript();
     }
-};
 
-// Main class for the module
-class EnhancedGroundTargeting : public WorldScript
+    if (Unit* selectedTarget = player->GetSelectedUnit())
+        destination.Relocate(selectedTarget->GetPositionX(), selectedTarget->GetPositionY(),
+                             selectedTarget->GetPositionZ(), player->GetOrientation());
+    else
+        destination.Relocate(player->GetPositionX(), player->GetPositionY(), player->GetPositionZ(),
+                             player->GetOrientation());
+
+    return ValidateDestination(player, spell, destination);
+}
+
+void ApplyDestination(Spell* spell, Position const& destination)
+{
+    spell->m_targets.SetDst(destination);
+    uint32 targetMask = spell->m_targets.GetTargetMask() | TARGET_FLAG_DEST_LOCATION;
+    targetMask &= ~TARGET_FLAG_UNIT;
+    targetMask &= ~TARGET_FLAG_GAMEOBJECT;
+    spell->m_targets.SetTargetMask(targetMask);
+    spell->m_targets.SetUnitTarget(nullptr);
+}
+}
+
+class EnhancedGroundTargetingWorldScript : public WorldScript
 {
 public:
-    EnhancedGroundTargeting() : WorldScript("EnhancedGroundTargeting") {}
+    EnhancedGroundTargetingWorldScript() : WorldScript("EnhancedGroundTargetingWorldScript") { }
 
     void OnAfterConfigLoad(bool /*reload*/) override
     {
-        // Load configuration options
-        enabled = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true);
-        autoTarget = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true);
-        combatOnly = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.CombatOnly", true);
-        smartPositioning = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.SmartPositioning", true);
-        minEnemiesForSmart = sConfigMgr->GetOption<uint32>("EnhancedGroundTargeting.MinEnemiesForSmart", 2);
+        moduleSettings.Enabled = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true);
+        moduleSettings.AutoTarget = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true);
+        moduleSettings.CombatOnly = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.CombatOnly", true);
+        moduleSettings.SmartPositioning =
+            sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.SmartPositioning", true);
+        moduleSettings.MinEnemiesForSmart = std::max<uint32>(
+            1, sConfigMgr->GetOption<uint32>("EnhancedGroundTargeting.MinEnemiesForSmart", 2));
 
-        if (enabled)
-        {
-            // Use proper logging for your core version
-            LOG_INFO("server.loading", "Enhanced Ground Targeting Module: Enabled");
-            if (autoTarget)
-                LOG_INFO("server.loading", "Enhanced Ground Targeting Module: Auto-targeting enabled");
-            if (combatOnly)
-                LOG_INFO("server.loading", "Enhanced Ground Targeting Module: Combat-only targeting enabled");
-            if (smartPositioning)
-                LOG_INFO("server.loading", "Enhanced Ground Targeting Module: Smart positioning enabled (min enemies: {})", minEnemiesForSmart);
-            
-            LOG_INFO("server.loading", "Enhanced Ground Targeting: IMPORTANT: You need to apply the SQL to your database!");
-        }
+        LOG_INFO("server.loading",
+                 "Enhanced Ground Targeting: enabled={}, autoTarget={}, combatOnly={}, smartPositioning={}, "
+                 "minEnemies={}",
+                 moduleSettings.Enabled, moduleSettings.AutoTarget, moduleSettings.CombatOnly,
+                 moduleSettings.SmartPositioning, moduleSettings.MinEnemiesForSmart);
     }
-
-private:
-    bool enabled;
-    bool autoTarget;
-    bool combatOnly;
-    bool smartPositioning;
-    uint32 minEnemiesForSmart;
 };
 
-class EnhancedGroundTargeting_AllSpellScript : public AllSpellScript
+class EnhancedGroundTargetingAllSpellScript : public AllSpellScript
 {
 public:
-    EnhancedGroundTargeting_AllSpellScript() : AllSpellScript("EnhancedGroundTargeting_AllSpellScript") {}
+    EnhancedGroundTargetingAllSpellScript() : AllSpellScript("EnhancedGroundTargetingAllSpellScript") { }
 
-    bool CanPrepare(Spell* spell, SpellCastTargets const* targets, AuraEffect const* /*triggeredByAura*/) override
+    bool CanPrepare(Spell* spell, SpellCastTargets const* /*targets*/, AuraEffect const* /*triggeredByAura*/) override
     {
-        Unit* caster = spell->GetCaster();
-        if (!caster || !caster->ToPlayer())
+        Unit* caster = spell ? spell->GetCaster() : nullptr;
+        Player* player = caster ? caster->ToPlayer() : nullptr;
+        SpellInfo const* spellInfo = spell ? spell->GetSpellInfo() : nullptr;
+        if (!player || !spellInfo || !IsSupportedSpell(spellInfo->Id))
             return true;
 
-        Player* player = caster->ToPlayer();
-        uint32 spellId = spell->GetSpellInfo()->Id;
-
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
+        if (!moduleSettings.Enabled || !moduleSettings.AutoTarget || !IsEnabledFor(player))
             return true;
 
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true))
-            return true;
-        
-        // Check if player has toggled off the feature
-        if (!GetPlayerToggleState(player->GetGUID().GetCounter()))
-            return true;
-            
-        // Check if this is one of our registered spells
-        bool isRegisteredSpell = false;
-        
-        // Check against registered spell IDs
-        std::vector<uint32> registeredSpells = {
-            1510, 14294, 14295, 27022, 58431, 58432, // Volley
-            900000, 900001, 900002, 900003, 900004, // Trap Launcher
-            10, 6141, 8427, 10185, 10186, 10187, 27085, 42939, 42940, // Blizzard
-            5740, 6219, 11677, 11678, 27212, 47819, 47820, // Rain of Fire
-            43265, 49936, 49937, 49938, // Death and Decay
-            2120, 2121, 8422, 8423, 10215, 10216, 27086, 42925, 42926 // Flamestrike
-        };
-        
-        for (uint32 registeredId : registeredSpells)
-        {
-            if (spellId == registeredId)
-            {
-                isRegisteredSpell = true;
-                break;
-            }
-        }
-        
-        if (!isRegisteredSpell)
-            return true;
-            
-        // ALWAYS force a valid destination, regardless of current state
-        Unit* target = player->GetSelectedUnit();
-        float targetX, targetY, targetZ;
-        
-        if (target)
-        {
-            targetX = target->GetPositionX();
-            targetY = target->GetPositionY();
-            targetZ = target->GetPositionZ();
-        }
-        else
-        {
-            targetX = player->GetPositionX();
-            targetY = player->GetPositionY();
-            targetZ = player->GetPositionZ();
-        }
-        
-        // Try smart positioning if enabled
-        bool smartEnabled = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.SmartPositioning", true);
-        if (smartEnabled && target)
-        {
-            AOEPosition optimalPos = CalculateOptimalAOEPosition(player, 8.0f, spell->GetSpellInfo());
-            if (optimalPos.isValid && optimalPos.targetCount >= 2)
-            {
-                targetX = optimalPos.x;
-                targetY = optimalPos.y;
-                targetZ = optimalPos.z;
-            }
-        }
-        
-        ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spell->GetSpellInfo());
-        
-        spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-        spell->m_targets.SetTargetMask(TARGET_FLAG_DEST_LOCATION);
-        spell->m_targets.SetUnitTarget(nullptr);
-        
+        Position destination;
+        if (SelectDestination(player, spell, destination))
+            ApplyDestination(spell, destination);
+
         return true;
     }
-
-    void OnSpellCheckCast(Spell* spell, bool /*strict*/, SpellCastResult& res) override
-    {
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
-            return;
-            
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.AutoTarget", true))
-            return;
-
-        Unit* caster = spell->GetCaster();
-        if (!caster || !caster->ToPlayer())
-            return;
-
-        Player* player = caster->ToPlayer();
-        
-        // Check if player has toggled off the feature
-        if (!GetPlayerToggleState(player->GetGUID().GetCounter()))
-            return;
-            
-        // Check if this is one of our registered spells
-        uint32 spellId = spell->GetSpellInfo()->Id;
-        bool isRegisteredSpell = false;
-        
-        // Check against registered spell IDs
-        std::vector<uint32> registeredSpells = {
-            // Volley
-            1510, 14294, 14295, 27022, 58431, 58432,
-            // Trap Launcher
-            900000, 900001, 900002, 900003, 900004,
-            // Blizzard
-            10, 6141, 8427, 10185, 10186, 10187, 27085, 42939, 42940,
-            // Rain of Fire
-            5740, 6219, 11677, 11678, 27212, 47819, 47820,
-            // Death and Decay
-            43265, 49936, 49937, 49938,
-            // Flamestrike
-            2120, 2121, 8422, 8423, 10215, 10216, 27086, 42925, 42926
-        };
-        
-        for (uint32 registeredId : registeredSpells)
-        {
-            if (spellId == registeredId)
-            {
-                isRegisteredSpell = true;
-                break;
-            }
-        }
-        
-        if (!isRegisteredSpell)
-            return;
-            
-        // Store original error before we start modifying things
-        SpellCastResult originalError = res;
-        
-        // Check if we're getting a targeting error
-        if (res == SPELL_FAILED_BAD_TARGETS || res == SPELL_FAILED_NO_VALID_TARGETS || 
-            res == SPELL_FAILED_REQUIRES_AREA || res == SPELL_FAILED_BAD_IMPLICIT_TARGETS ||
-            res == SPELL_FAILED_ONLY_OUTDOORS || res == SPELL_FAILED_LINE_OF_SIGHT ||
-            res == SPELL_FAILED_OUT_OF_RANGE || res == SPELL_FAILED_TOO_CLOSE)
-        {
-            // Force a valid destination to bypass cursor validation
-            Unit* target = player->GetSelectedUnit();
-            float targetX, targetY, targetZ;
-            
-            if (target)
-            {
-                targetX = target->GetPositionX();
-                targetY = target->GetPositionY();
-                targetZ = target->GetPositionZ();
-            }
-            else
-            {
-                targetX = player->GetPositionX();
-                targetY = player->GetPositionY();
-                targetZ = player->GetPositionZ();
-            }
-            
-            SpellInfo const* spellInfo = spell->GetSpellInfo();
-            ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spellInfo);
-            
-            spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-            spell->m_targets.SetTargetMask(spell->m_targets.GetTargetMask() | TARGET_FLAG_DEST_LOCATION);
-            
-            // Handle specific error types
-            if (originalError == SPELL_FAILED_ONLY_OUTDOORS)
-            {
-                targetX = player->GetPositionX() + 5.0f;
-                targetY = player->GetPositionY() + 5.0f;
-                targetZ = player->GetPositionZ();
-                player->UpdateAllowedPositionZ(targetX, targetY, targetZ);
-                spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-            }
-            
-            res = SPELL_CAST_OK;
-        }
-        else if (!(spell->m_targets.GetTargetMask() & TARGET_FLAG_DEST_LOCATION))
-        {
-            Unit* target = player->GetSelectedUnit();
-            float targetX, targetY, targetZ;
-            
-            if (target)
-            {
-                targetX = target->GetPositionX();
-                targetY = target->GetPositionY();
-                targetZ = target->GetPositionZ();
-            }
-            else
-            {
-                targetX = player->GetPositionX();
-                targetY = player->GetPositionY();
-                targetZ = player->GetPositionZ();
-            }
-            
-            ValidateAndAdjustPosition(player, targetX, targetY, targetZ, spell->GetSpellInfo());
-            
-            spell->m_targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-            spell->m_targets.SetTargetMask(spell->m_targets.GetTargetMask() | TARGET_FLAG_DEST_LOCATION);
-            
-        }
-    }
 };
 
-// Player Script for enhancing targeting
-class EnhancedGroundTargeting_PlayerScript : public PlayerScript
+class EnhancedGroundTargetingPlayerScript : public PlayerScript
 {
 public:
-    EnhancedGroundTargeting_PlayerScript() : PlayerScript("EnhancedGroundTargeting_PlayerScript") {}
+    EnhancedGroundTargetingPlayerScript() : PlayerScript("EnhancedGroundTargetingPlayerScript") { }
 
-    void OnLogin(Player* player)
+    void OnPlayerLogin(Player* player) override
     {
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
+        WorldSession* session = player ? player->GetSession() : nullptr;
+        if (!session || session->IsBot())
             return;
 
+        ObjectGuid const guid = player->GetGUID();
+        uint64 const loadId = ++nextLoadId;
+        ToggleState* state = player->CustomData.GetDefault<ToggleState>(SETTING_SOURCE);
+        state->LoadId.store(loadId, std::memory_order_relaxed);
+        state->Enabled.store(false, std::memory_order_relaxed);
+        state->ChangedAfterLogin.store(false, std::memory_order_relaxed);
+
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHAR_SETTINGS);
+        stmt->SetData(0, guid.GetCounter());
+        session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(stmt).WithPreparedCallback(
+            [guid, loadId](PreparedQueryResult result)
+            {
+                LoadToggleState(guid, loadId, std::move(result));
+            }));
     }
-    
-    void OnPlayerSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
-    {
-    }
+
 };
 
-// Command Script for .toggle command
 using namespace Acore::ChatCommands;
 
-class EnhancedGroundTargeting_CommandScript : public CommandScript
+class EnhancedGroundTargetingCommandScript : public CommandScript
 {
 public:
-    EnhancedGroundTargeting_CommandScript() : CommandScript("EnhancedGroundTargeting_CommandScript") {}
+    EnhancedGroundTargetingCommandScript() : CommandScript("EnhancedGroundTargetingCommandScript") { }
 
     ChatCommandTable GetCommands() const override
     {
         static ChatCommandTable commandTable =
         {
-            { "toggle", HandleToggleCommand, SEC_PLAYER, Console::No },
-            { "testcast", HandleTestCastCommand, SEC_PLAYER, Console::No }
+            { "toggle", HandleToggleCommand, SEC_PLAYER, Console::No }
         };
         return commandTable;
     }
@@ -748,127 +538,47 @@ public:
         if (!player)
             return false;
 
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
+        if (!moduleSettings.Enabled)
         {
-            handler->PSendSysMessage("Enhanced Ground Targeting is disabled on this server.");
+            handler->SendSysMessage("Enhanced Ground Targeting is disabled on this server.");
             return true;
         }
 
-        // Parse arguments
-        std::string arg = args ? args : "";
-        std::transform(arg.begin(), arg.end(), arg.begin(), ::tolower);
-
-        uint64 playerGuid = player->GetGUID().GetCounter();
-        bool currentState = GetPlayerToggleState(playerGuid);
-
-        if (arg == "on" || arg == "enable" || arg == "1")
+        std::string argument = args ? args : "";
+        std::transform(argument.begin(), argument.end(), argument.begin(), [](unsigned char character)
         {
-            SetPlayerToggleState(playerGuid, true);
-            handler->PSendSysMessage("Enhanced Ground Targeting: |cff00ff00ENABLED|r");
-        }
-        else if (arg == "off" || arg == "disable" || arg == "0")
+            return static_cast<char>(std::tolower(character));
+        });
+
+        bool enabled = IsEnabledFor(player);
+        if (argument.empty())
+            enabled = !enabled;
+        else if (argument == "on" || argument == "enable" || argument == "1")
+            enabled = true;
+        else if (argument == "off" || argument == "disable" || argument == "0")
+            enabled = false;
+        else if (argument == "status")
         {
-            SetPlayerToggleState(playerGuid, false);
-            handler->PSendSysMessage("Enhanced Ground Targeting: |cffff0000DISABLED|r");
+            handler->PSendSysMessage("Enhanced Ground Targeting is {}.", enabled ? "enabled" : "disabled");
+            return true;
         }
         else
         {
-            // Toggle current state
-            bool newState = !currentState;
-            SetPlayerToggleState(playerGuid, newState);
-            handler->PSendSysMessage("Enhanced Ground Targeting: %s", 
-                newState ? "|cff00ff00ENABLED|r" : "|cffff0000DISABLED|r");
-        }
-
-        return true;
-    }
-    
-    static bool HandleTestCastCommand(ChatHandler* handler, char const* args)
-    {
-        Player* player = handler->GetSession()->GetPlayer();
-        if (!player)
-            return false;
-
-        if (!sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.Enable", true))
-        {
-            handler->PSendSysMessage("Enhanced Ground Targeting is disabled on this server.");
+            handler->SendSysMessage("Usage: .toggle [on|off|status]");
             return true;
         }
 
-        // Parse spell ID (default to Volley rank 1 if not specified)
-        uint32 spellId = 1510; // Volley Rank 1
-        if (args && strlen(args) > 0)
-        {
-            spellId = atoi(args);
-        }
-        
-        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
-        if (!spellInfo)
-        {
-            handler->PSendSysMessage("Invalid spell ID: %u", spellId);
-            return true;
-        }
-        
-        // Force enable the feature for this player temporarily
-        bool wasEnabled = GetPlayerToggleState(player->GetGUID().GetCounter());
-        SetPlayerToggleState(player->GetGUID().GetCounter(), true);
-        
-        // Create spell cast targets with forced destination
-        Unit* target = player->GetSelectedUnit();
-        float targetX, targetY, targetZ;
-        
-        if (target)
-        {
-            targetX = target->GetPositionX();
-            targetY = target->GetPositionY();
-            targetZ = target->GetPositionZ();
-        }
-        else
-        {
-            targetX = player->GetPositionX();
-            targetY = player->GetPositionY();
-            targetZ = player->GetPositionZ();
-        }
-        
-        // Ensure valid ground position
-        player->UpdateAllowedPositionZ(targetX, targetY, targetZ);
-        
-        // Try smart positioning if enabled
-        bool smartEnabled = sConfigMgr->GetOption<bool>("EnhancedGroundTargeting.SmartPositioning", true);
-        if (smartEnabled)
-        {
-            AOEPosition optimalPos = CalculateOptimalAOEPosition(player, 8.0f, spellInfo);
-            if (optimalPos.isValid && optimalPos.targetCount >= 2)
-            {
-                targetX = optimalPos.x;
-                targetY = optimalPos.y;
-                targetZ = optimalPos.z;
-            }
-        }
-        
-        // Create spell cast targets
-        SpellCastTargets targets;
-        targets.SetDst(targetX, targetY, targetZ, player->GetOrientation());
-        targets.SetTargetMask(TARGET_FLAG_DEST_LOCATION);
-        
-        // Cast the spell with forced validation bypass
-        SpellCastResult result = player->CastSpell(targets, spellInfo, nullptr, TRIGGERED_FULL_MASK);
-        
-        // Restore original state
-        SetPlayerToggleState(player->GetGUID().GetCounter(), wasEnabled);
-        
-        handler->PSendSysMessage("Test cast result: %s", result == SPELL_CAST_OK ? "SUCCESS" : "FAILED");
-        
+        SaveToggleState(player, enabled);
+        handler->PSendSysMessage("Enhanced Ground Targeting: {}", enabled ? "|cff00ff00ENABLED|r" :
+                                                                   "|cffff0000DISABLED|r");
         return true;
     }
 };
 
-// AzerothCore script registration hook
 void AddSC_EnhancedGroundTargeting()
 {
-    new EnhancedGroundTargeting();
-    new spell_enhanced_ground_targeting();
-    new EnhancedGroundTargeting_AllSpellScript();
-    new EnhancedGroundTargeting_PlayerScript();
-    new EnhancedGroundTargeting_CommandScript();
+    new EnhancedGroundTargetingWorldScript();
+    new EnhancedGroundTargetingAllSpellScript();
+    new EnhancedGroundTargetingPlayerScript();
+    new EnhancedGroundTargetingCommandScript();
 }

@@ -4,6 +4,7 @@
 #
 #    EnhancedGroundTargeting.Enable
 #        Description: Enable the enhanced ground targeting module.
+#                    Characters remain opted out until they use .toggle on.
 #        Default:     1 - Enabled
 #                     0 - Disabled
 #
@@ -12,7 +13,7 @@ EnhancedGroundTargeting.Enable = 1
 
 #
 #    EnhancedGroundTargeting.AutoTarget
-#        Description: Enable auto-targeting at current target's position.
+#        Description: Replace supported spells' cursor destinations automatically.
 #        Default:     1 - Enabled
 #                     0 - Disabled
 #
@@ -21,7 +22,7 @@ EnhancedGroundTargeting.AutoTarget = 1
 
 #
 #    EnhancedGroundTargeting.CombatOnly
-#        Description: Only affect enemies that are in combat.
+#        Description: Only include the selected enemy or enemies engaged with the player's party or their pets.
 #        Default:     1 - Enabled
 #                     0 - Disabled
 #
@@ -30,11 +31,10 @@ EnhancedGroundTargeting.CombatOnly = 1
 
 #
 #    EnhancedGroundTargeting.SmartPositioning
-#        Description: Enable smart AOE positioning based on playerbot algorithms.
+#        Description: Enable smart AOE positioning.
 #                    When enabled, the system will calculate optimal positions
 #                    to hit maximum enemies instead of just targeting current target.
-#                    COMBAT SAFE: Only considers enemies already in combat with the player,
-#                    current target, or enemies attacking the player/pet (no unwanted pulls).
+#                    Combat safety is controlled by EnhancedGroundTargeting.CombatOnly.
 #        Default:     1 - Enabled (smart positioning)
 #                     0 - Disabled (simple target positioning)
 #
@@ -44,7 +44,7 @@ EnhancedGroundTargeting.SmartPositioning = 1
 #
 #    EnhancedGroundTargeting.MinEnemiesForSmart
 #        Description: Minimum number of enemies required to use smart positioning.
-#                    If fewer enemies are found, will fall back to target positioning.
+#                    If fewer enemies would be covered, falls back to target positioning.
 #        Default:     2 - Require at least 2 enemies for smart positioning
 #
 
