@@ -470,7 +470,8 @@ public:
 
     bool CanPrepare(Spell* spell, SpellCastTargets const* /*targets*/, AuraEffect const* /*triggeredByAura*/) override
     {
-        Unit* caster = spell ? spell->GetCaster() : nullptr;
+        WorldObject* casterObject = spell ? spell->GetCaster() : nullptr;
+        Unit* caster = casterObject ? casterObject->ToUnit() : nullptr;
         Player* player = caster ? caster->ToPlayer() : nullptr;
         SpellInfo const* spellInfo = spell ? spell->GetSpellInfo() : nullptr;
         if (!player || !spellInfo || !IsSupportedSpell(spellInfo->Id))
